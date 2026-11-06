@@ -1,0 +1,38 @@
+# Local hardware, calibration and environment
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+**/__pycache__/
+*.py[cod]
+*.log
+
+# Demonstrations and outputs can contain people, room details, serials and GBs of data
+data/
+datasets/
+recordings/
+raw/
+logs/
+outputs/
+checkpoints/
+*.mp4
+!media/act_v2_gpu_success.mp4
+*.avi
+*.parquet
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+*.jsonl
+scene_reference.jpg
+collection_config.json
+source_manifest.json
+quality.jsonl
+recording_events.jsonl
+
+# Local reports (curated numbers only are documented in README)
+reports/
+*.png
+*.jpg
+*.jpeg
