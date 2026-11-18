@@ -24,13 +24,17 @@ FPS = 20
 NAMES = ['shoulder_pan', 'shoulder_lift', 'elbow_flex', 'wrist_flex', 'wrist_roll', 'gripper']
 
 
-def features():
-    return {
+def features(include_wrist=False):
+    result = {
         'observation.state': {'dtype': 'float32', 'shape': (6,), 'names': [n+'.pos' for n in NAMES]},
         'action': {'dtype': 'float32', 'shape': (6,), 'names': [n+'.pos' for n in NAMES]},
         'observation.images.front': {'dtype': 'video', 'shape': (480, 640, 3),
                                      'names': ['height', 'width', 'channels']},
     }
+    if include_wrist:
+        result['observation.images.wrist'] = {'dtype': 'video', 'shape': (480, 640, 3),
+                                               'names': ['height', 'width', 'channels']}
+    return result
 
 
 def normalized(bus, raw):
@@ -45,6 +49,9 @@ def quality(samples):
     hz = float(1 / intervals.mean()) if len(intervals) and intervals.mean() > 0 else 0.
     max_gap = float(intervals.max()) if len(intervals) else 0.
     max_age = max((s['camera_age_s'] for s in samples), default=0.)
+    dual = any('wrist_camera_age_s' in s for s in samples)
+    wrist_ages = [s['wrist_camera_age_s'] for s in samples if 'wrist_camera_age_s' in s]
+    pair_skews = [s['camera_pair_skew_s'] for s in samples if 'camera_pair_skew_s' in s]
     reasons = []
     if len(samples) < 2*FPS:
         reasons.append('不足2秒')
@@ -55,9 +62,19 @@ def quality(samples):
     if max_gap > .1:
         reasons.append(f'采样间断{max_gap:.3f}秒超过0.1秒')
     if max_age > .1:
-        reasons.append('相机画面时间差超过0.1秒')
+        reasons.append('第三视角画面时间差超过0.1秒')
+    if dual:
+        if len(wrist_ages) != len(samples) or len(pair_skews) != len(samples):
+            reasons.append('双相机时间戳不完整')
+        if wrist_ages and max(wrist_ages) > .1:
+            reasons.append('腕部画面时间差超过0.1秒')
+        if pair_skews and max(pair_skews) > .05:
+            reasons.append('双相机最新帧时间差超过0.05秒')
     return {'frames': len(samples), 'effective_hz': hz, 'max_gap_s': max_gap,
-            'max_camera_age_s': max_age, 'accepted': not reasons, 'reasons': reasons}
+            'max_camera_age_s': max_age,
+            'max_wrist_camera_age_s': max(wrist_ages, default=None),
+            'max_camera_pair_skew_s': max(pair_skews, default=None),
+            'accepted': not reasons, 'reasons': reasons}
 
 
 class DatasetSink:
@@ -66,9 +83,10 @@ class DatasetSink:
         from lerobot.datasets.lerobot_dataset import LeRobotDataset
         from lerobot.configs.video import RGBEncoderConfig
         self.root = Path(root)
+        self.include_wrist = bool(config.get('wrist_camera'))
         self.dataset = LeRobotDataset.create(
             repo_id='local/'+self.root.name, root=self.root, fps=FPS,
-            robot_type='so101_follower', features=features(), use_videos=True,
+            robot_type='so101_follower', features=features(self.include_wrist), use_videos=True,
             image_writer_threads=2, encoder_threads=2,
             rgb_encoder=RGBEncoderConfig(vcodec='h264', preset='fast', crf=20),
         )
@@ -105,13 +123,18 @@ class DatasetSink:
             self.raw_index += 1
             self.raw_count = 0
             self.raw_log = (self.raw_dir/'frames.jsonl').open('x', encoding='utf-8')
-        filename = f'frame_{self.raw_count:06d}.jpg'
-        ok, encoded = cv2.imencode('.jpg', cv2.cvtColor(frame['observation.images.front'], cv2.COLOR_RGB2BGR),
-                                    [cv2.IMWRITE_JPEG_QUALITY, 95])
-        if not ok:
-            raise RuntimeError('原始画面备份编码失败')
-        (self.raw_dir/filename).write_bytes(encoded.tobytes())
-        self.raw_log.write(json.dumps({'image': filename, 'task': frame['task'],
+        images = {}
+        for key, suffix in [('observation.images.front', ''), ('observation.images.wrist', '_wrist')]:
+            if key not in frame:
+                continue
+            filename = f'frame_{self.raw_count:06d}{suffix}.jpg'
+            ok, encoded = cv2.imencode('.jpg', cv2.cvtColor(frame[key], cv2.COLOR_RGB2BGR),
+                                        [cv2.IMWRITE_JPEG_QUALITY, 95])
+            if not ok:
+                raise RuntimeError(f'{key} 原始画面备份编码失败')
+            (self.raw_dir/filename).write_bytes(encoded.tobytes())
+            images['image_wrist' if suffix else 'image'] = filename
+        self.raw_log.write(json.dumps({**images, 'task': frame['task'],
                                       'state': frame['observation.state'].tolist(),
                                       'action': frame['action'].tolist(), 'timing': timing})+'\n')
         self.raw_log.flush()
@@ -227,7 +250,7 @@ class Camera:
         cap = cv2.VideoCapture(self.device, cv2.CAP_V4L2)
         try:
             if not cap.isOpened():
-                raise RuntimeError('无法打开第三视角相机，请关闭原来的相机预览窗口')
+                raise RuntimeError(f'无法打开相机 {self.device}，请关闭占用它的预览窗口')
             cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
@@ -254,14 +277,15 @@ class Camera:
         deadline = time.monotonic()+wait_s
         while True:
             if self.error:
-                raise RuntimeError(self.error)
+                raise RuntimeError(f'相机 {getattr(self, "device", "未知设备")}：{self.error}')
             frame = self.latest
             age = time.monotonic()-frame[0] if frame is not None else float('inf')
             if frame is not None and age <= max_age and (min_sequence is None or frame[1] != min_sequence):
                 return frame
             if time.monotonic() >= deadline:
                 seq = frame[1] if frame is not None else None
-                raise RuntimeError(f'相机没有新画面：上一帧序号{min_sequence}，当前{seq}，画面距今{age:.3f}秒')
+                raise RuntimeError(f'相机 {getattr(self, "device", "未知设备")} 没有新画面：'
+                                   f'上一帧序号{min_sequence}，当前{seq}，画面距今{age:.3f}秒')
             time.sleep(.002)
 
     def close(self):
@@ -274,6 +298,7 @@ class Recorder:
                  preview_factory=PreviewProcess, sink_factory=DatasetSink):
         self.ui = None
         self.camera = None
+        self.wrist_camera = None
         self.sink = None
         self.event_file = None
         self.phase = 'idle'
@@ -282,6 +307,7 @@ class Recorder:
         self.alignment = None
         self.samples = []
         self.last_seq = None
+        self.last_wrist_seq = None
         self.last_preview = 0.
         self.notice = '按回车或点击“原位保持”，然后 R 跟随、C 录制、S 保存。'
         self.warning = False
@@ -294,14 +320,23 @@ class Recorder:
         try:
             if shutil.disk_usage(Path.home()).free < 5*1024**3:
                 raise RuntimeError('可用磁盘空间不足5GB，请先清理空间')
+            if args.wrist_camera and Path(args.camera).resolve() == Path(args.wrist_camera).resolve():
+                raise RuntimeError('第三视角和腕部相机指向同一设备；请分别使用两条 /dev/v4l/by-path 路径')
             self.camera = camera_factory(args.camera)
+            if args.wrist_camera:
+                self.wrist_camera = camera_factory(args.wrist_camera)
             deadline = time.monotonic()+5
-            while self.camera.latest is None and not self.camera.error and time.monotonic() < deadline:
+            while (self.camera.latest is None or
+                   (self.wrist_camera and self.wrist_camera.latest is None)) and time.monotonic() < deadline:
+                if self.camera.error or (self.wrist_camera and self.wrist_camera.error):
+                    break
                 time.sleep(.05)
             self.camera.get()
+            if self.wrist_camera:
+                self.wrist_camera.get()
             self.ui = preview_factory()
             config = {'task': args.task, 'profile': args.profile, 'fps': FPS,
-                      'camera': args.camera, 'width':640, 'height':480,
+                      'camera': args.camera, 'wrist_camera': args.wrist_camera, 'width':640, 'height':480,
                       'robot_type':'so101_follower', 'robot_id':'white_follower', 'use_degrees':True,
                       'action_semantics':'follower absolute Goal_Position, after relative mapping/rate/position limits, normalized with installed bus',
                       'sync':'latest camera receipt before motor command; host monotonic times in quality.jsonl; not hardware exposure synchronization',
@@ -325,7 +360,11 @@ class Recorder:
             self.notify(event['message'], warning=event['kind'] == 'archived', event=event['kind'])
         if time.monotonic()-self.last_preview >= .1:
             frame = self.camera.latest
-            self.ui.publish(self.snapshot(), None if frame is None else frame[2])
+            wrist = self.wrist_camera.latest if self.wrist_camera else None
+            preview = None if frame is None else frame[2]
+            if self.wrist_camera:
+                preview = None if frame is None or wrist is None else np.concatenate((frame[2], wrist[2]), axis=1)
+            self.ui.publish(self.snapshot(), preview)
             self.last_preview = time.monotonic()
         return self.ui.keys()
 
@@ -343,7 +382,8 @@ class Recorder:
     def status_line(self):
         controls = {'startup':'待原位保持', 'holding':'白臂保持', 'following':'白臂跟随', 'stopped':'控制结束'}
         phases = {'idle':'未录制', 'recording':'● 正在录制', 'review':'待保存', 'saving':'正在写入，请稍候'}
-        return (f'{controls[self.control]} | {phases[self.phase]} | 当前{len(self.samples)}帧 '
+        cameras = ' | 左：第三视角，右：腕部' if self.wrist_camera else ''
+        return (f'{controls[self.control]} | {phases[self.phase]}{cameras} | 当前{len(self.samples)}帧 '
                 f'({len(self.samples)/FPS:.1f}秒) | 训练数据{self.sink.saved}段 / 待检查备份{self.sink.archived}段')
 
     def snapshot(self):
@@ -359,7 +399,11 @@ class Recorder:
             else:
                 allowed += ['x']
         camera_age = time.monotonic()-self.camera.latest[0] if self.camera.latest else float('inf')
-        camera_note = ' | 相机画面暂停' if self.camera.error or camera_age > .5 else ''
+        wrist_age = (time.monotonic()-self.wrist_camera.latest[0] if self.wrist_camera and self.wrist_camera.latest
+                     else float('inf'))
+        camera_note = (' | 第三视角画面暂停' if self.camera.error or camera_age > .5 else '')
+        if self.wrist_camera and (self.wrist_camera.error or wrist_age > .5):
+            camera_note += ' | 腕部画面暂停'
         return {'summary': self.status_line()+camera_note, 'notice': self.notice,
                 'warning': self.warning, 'path': f'保存目录：{self.path}', 'allowed': allowed,
                 'phase': self.phase, 'control': self.control, 'frames': len(self.samples),
@@ -400,11 +444,14 @@ class Recorder:
             else:
                 try:
                     self.camera.get(max_age=.1)
+                    if self.wrist_camera:
+                        self.wrist_camera.get(max_age=.1)
                 except RuntimeError as exc:
                     self.notify(f'收到 C，但相机尚未就绪：{exc}', warning=True)
                     return ''
                 self.samples = []
                 self.last_seq = None
+                self.last_wrist_seq = None
                 self.fault_reason = None
                 self.started = time.monotonic()
                 self.phase = 'recording'
@@ -454,6 +501,17 @@ class Recorder:
         # 60 fps camera period plus scheduling slack before declaring a dropout.
         try:
             receipt, seq, image = self.camera.get(min_sequence=self.last_seq, max_age=.1, wait_s=.025)
+            wrist = None
+            if self.wrist_camera:
+                wrist = self.wrist_camera.get(min_sequence=self.last_wrist_seq, max_age=.1, wait_s=.025)
+            age = abs(state_time-receipt)
+            if age > .1:
+                raise RuntimeError(f'第三视角与关节采样相差{age:.3f}秒')
+            if wrist:
+                wrist_age = abs(state_time-wrist[0])
+                pair_skew = abs(receipt-wrist[0])
+                if wrist_age > .1 or pair_skew > .05:
+                    raise RuntimeError(f'双相机采样超时：腕部{wrist_age:.3f}秒，两路相差{pair_skew:.3f}秒')
         except RuntimeError as exc:
             self.phase = 'review'
             self.fault_reason = str(exc)
@@ -462,13 +520,17 @@ class Recorder:
                 self.control = 'holding'
             self.notify(f'相机采集暂停：{exc}。已录片段仍保留；按 S 保存待检查备份。', warning=True, event='camera_fault')
             return None
-        age = abs(state_time-receipt)
-        if age > .1:
-            raise RuntimeError(f'相机与关节采样相差{age:.3f}秒，当前段未保存')
         self.last_seq = seq
-        return {'observation.state':normalized(self.bus, actual), 'observation.images.front':image,
-                'task':self.task}, {'state_time':state_time, 'camera_receipt_time':receipt,
-                                   'camera_age_s':age, 'camera_sequence':seq}
+        frame = {'observation.state':normalized(self.bus, actual), 'observation.images.front':image,
+                 'task':self.task}
+        timing = {'state_time':state_time, 'camera_receipt_time':receipt,
+                  'camera_age_s':age, 'camera_sequence':seq}
+        if wrist:
+            self.last_wrist_seq = wrist[1]
+            frame['observation.images.wrist'] = wrist[2]
+            timing.update({'wrist_camera_receipt_time':wrist[0], 'wrist_camera_age_s':wrist_age,
+                           'wrist_camera_sequence':wrist[1], 'camera_pair_skew_s':pair_skew})
+        return frame, timing
 
     def sent(self, sample, goals):
         if sample is None:
@@ -482,6 +544,8 @@ class Recorder:
     def close(self):
         if self.camera:
             self.camera.close()
+        if self.wrist_camera:
+            self.wrist_camera.close()
         try:
             if self.sink:
                 self.sink.close()

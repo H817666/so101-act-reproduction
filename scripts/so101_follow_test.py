@@ -246,6 +246,8 @@ def main():
     parser.add_argument('--dataset-dir', type=Path, help='新数据集目录，必须不存在；默认自动生成时间戳')
     parser.add_argument('--episode-seconds', type=int, default=45)
     parser.add_argument('--camera', default=os.getenv('SO101_CAMERA'))
+    parser.add_argument('--wrist-camera', default=os.getenv('SO101_WRIST_CAMERA'),
+                        help='可选腕部相机；与 --camera 一起录制双视角')
     parser.add_argument('--leader-port', default=os.getenv('SO101_LEADER_PORT'))
     parser.add_argument('--follower-port', default=os.getenv('SO101_FOLLOWER_PORT'))
     args = parser.parse_args()

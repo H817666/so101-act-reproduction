@@ -18,6 +18,8 @@ outputs/
 checkpoints/
 *.mp4
 !media/act_v2_gpu_success.mp4
+!media/act_cap_dual_success.mp4
+!media/act_tube_insertion_demo.mp4
 *.avi
 *.parquet
 *.safetensors
